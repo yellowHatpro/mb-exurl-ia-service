@@ -1,10 +1,9 @@
-#![allow(dead_code)]
 // Generated with sql-gen
 // https://github.com/jayy-lmao/sql-gen
 use serde::Deserialize;
 use sqlx::types::chrono;
 
-#[derive(sqlx::FromRow, Debug, Deserialize)]
+#[derive(sqlx::FromRow, Debug, Deserialize, Clone)]
 pub struct InternetArchiveUrls {
     pub id: i32,
     pub url: Option<String>,
@@ -14,4 +13,5 @@ pub struct InternetArchiveUrls {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub retry_count: Option<i32>,
     pub is_saved: Option<bool>,
+    pub status: Option<String>,
 }

@@ -1,9 +1,14 @@
-use crate::archival::archival_response::{ArchivalHtmlResponse, ArchivalResponse};
+use crate::archival::archival_response::{
+    ArchivalHtmlResponse, ArchivalResponse, ArchivalStatusResponse,
+};
 use crate::archival::client::REQWEST_CLIENT;
 use crate::archival::error::ArchivalError;
+use crate::configuration::Settings;
 use crate::structs::internet_archive_urls::InternetArchiveUrls;
-use sqlx::PgPool;
+use sqlx::{Error, PgPool};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time;
 
 ///This function is used to find the row in internet_archive_urls from where we can start the archival task
 /// The notify function will start picking URLs from the returned row id
@@ -29,7 +34,7 @@ pub async fn get_first_id_to_start_notifier_from(pool: PgPool) -> Option<i32> {
 }
 
 /// Updates a row in `internet_archive_urls` table with the `job_id` response received from `Wayback Machine API` request, and marks `is_saved` true.
-pub async fn set_job_id_ia_url(pool: &PgPool, job_id: String, id: i32) -> Result<(), sqlx::Error> {
+pub async fn set_job_id_ia_url(pool: &PgPool, job_id: String, id: i32) -> Result<(), Error> {
     let query = r#"
         UPDATE external_url_archiver.internet_archive_urls
         SET
@@ -45,7 +50,7 @@ pub async fn set_job_id_ia_url(pool: &PgPool, job_id: String, id: i32) -> Result
     Ok(())
 }
 
-pub async fn inc_archive_request_retry_count(pool: &PgPool, id: i32) -> Result<(), sqlx::Error> {
+pub async fn inc_archive_request_retry_count(pool: &PgPool, id: i32) -> Result<(), Error> {
     let query = r#"
         UPDATE external_url_archiver.internet_archive_urls
         SET
@@ -74,6 +79,7 @@ pub async fn is_row_exists(pool: &PgPool, row_id: i32) -> bool {
     }
 }
 
+///Handles the network request to archive the URL
 pub async fn make_archival_network_request(
     url: &str,
     endpoint_url: &str,
@@ -93,6 +99,109 @@ pub async fn make_archival_network_request(
     Ok(ArchivalResponse::Html(ArchivalHtmlResponse {
         html: response_text,
     }))
+}
+
+///Checks the status of `job_id` of a URL
+pub async fn make_archival_status_request(
+    job_id: &str,
+    endpoint_url: &str,
+) -> Result<ArchivalStatusResponse, ArchivalError> {
+    let client = Arc::clone(&REQWEST_CLIENT);
+    let response = client
+        .post(endpoint_url)
+        .body(format!("job_id={}", job_id))
+        .send()
+        .await?;
+    // let response_status = response.status();
+    let response_text = response.text().await?;
+
+    if let Ok(res) = serde_json::from_str::<ArchivalStatusResponse>(&response_text) {
+        return Ok(res);
+    }
+    Ok(ArchivalStatusResponse::Html(ArchivalHtmlResponse {
+        html: response_text,
+    }))
+}
+
+///Schedules the status check of a URL's `job_id`, and
+pub async fn schedule_status_check(
+    job_id: String,
+    endpoint_url: &str,
+    id: i32,
+    pool: PgPool,
+) -> Result<(), ArchivalError> {
+    let settings = Settings::new().expect("Config settings are not configured properly");
+
+    for attempt in 1..=3 {
+        time::sleep(Duration::from_secs(
+            settings.listen_task.sleep_status_interval,
+        ))
+        .await;
+        match make_archival_status_request(job_id.as_str(), endpoint_url).await? {
+            ArchivalStatusResponse::Ok(status_response) => {
+                if status_response.status == "success" {
+                    set_status(&pool, id, status_response.status).await?;
+                    return Ok(());
+                } else if status_response.status == "pending" {
+                    println!(
+                        "Job {} is still pending. Time: {:?}",
+                        job_id,
+                        chrono::Utc::now()
+                    );
+                } else {
+                    println!(
+                        "Job {} returned status '{}', retry count : {}",
+                        job_id, status_response.status, attempt
+                    );
+                }
+            }
+            ArchivalStatusResponse::Err(e) => {
+                eprintln!("Error making status check request: {:?}", e)
+            }
+            ArchivalStatusResponse::Html(message) => {
+                println!(
+                    "Internet Archive cannot archive currently, job {} cannot be checked for status. Response message: {}",
+                    job_id, message.html
+                )
+            }
+        }
+    }
+
+    // After 3 attempts, if still not success, update the status with the last response or Error
+    match make_archival_status_request(job_id.as_str(), endpoint_url).await? {
+        ArchivalStatusResponse::Ok(status_response) => {
+            set_status(&pool, id, status_response.status).await?;
+        }
+        ArchivalStatusResponse::Err(e) => {
+            set_status(&pool, id, format!("Error: Could not save: {:?}", e)).await?;
+            eprintln!("Error making final status check request: {:?}", e)
+        }
+        ArchivalStatusResponse::Html(message) => {
+            set_status(
+                &pool,
+                id,
+                format!("Error: Could not save: {}", message.html),
+            )
+            .await?;
+            eprintln!("Error making final status check request: {}", message.html)
+        }
+    }
+    Ok(())
+}
+
+pub async fn set_status(pool: &PgPool, id: i32, status: String) -> Result<(), Error> {
+    let query = r#"
+        UPDATE external_url_archiver.internet_archive_urls
+        SET
+        status = $1
+        WHERE id = $2
+        "#;
+    sqlx::query(query)
+        .bind(status)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
